@@ -1,0 +1,188 @@
+# ============================================================
+#  EEGNet V4 — Research Pipeline Configuration
+#  Motor Imagery Classification: EEGMMIDB → BCI IV 2a
+# ============================================================
+
+# ─────────────────────────── PATHS ──────────────────────────
+# Set these to your actual dataset directories.
+# EEGMMIDB: https://physionet.org/content/eegmmidb/1.0.0/
+#   Download as EDF files per subject (S001–S109)
+# BCI IV 2a: https://www.bbci.de/competition/iv/
+#   Download A01T.gdf … A09T.gdf (train) and A01E.gdf … A09E.gdf (eval)
+
+paths:
+  eegmmidb_root:   "/data/eegmmidb"          # root containing S001/, S002/, … S109/
+  bciv2a_root:     "/data/bciv2a"             # root containing A01T.gdf … A09E.gdf, *.mat labels
+  pretrained_ckpt: "checkpoints/eegmmidb_pretrained.pth"
+  finetuned_ckpt:  "checkpoints/bciv2a_finetuned_s{subject:02d}.pth"
+  logs_dir:        "logs"
+  results_dir:     "results"
+
+# ──────────────────── EEGMMIDB DATASET ──────────────────────
+eegmmidb:
+  subjects:        null           # null → all 109; or list e.g. [1,2,3]
+  # PhysioNet run numbers for each MI task
+  # Runs 3,7,11 → left/right hand  |  Runs 5,9,13 → hands/feet
+  mi_runs:         [3, 5, 7, 9, 11, 13]
+  sfreq:           160            # native Hz
+  n_channels:      64
+  # 0=rest  1=left hand  2=right hand  3=both hands  4=feet
+  event_id:
+    rest:           0
+    left_hand:      1
+    right_hand:     2
+    both_hands:     3
+    feet:           4
+  # Map to 4-class output used during pretraining
+  pretrain_classes: [1, 2, 3, 4]  # exclude rest
+  tmin:           -0.5            # epoch start relative to cue (s)
+  tmax:            2.5            # epoch end   (gives 480 samples at 160 Hz)
+  baseline:        [-0.5, 0.0]
+
+# ──────────────────── BCI IV 2A DATASET ─────────────────────
+bciv2a:
+  subjects:        [1, 2, 3, 4, 5, 6, 7, 8, 9]
+  sfreq:           250            # native Hz
+  n_eeg_channels:  22
+  n_eog_channels:  3
+  # event codes in GDF (cue onset annotations)
+  event_id:
+    left_hand:      769
+    right_hand:     770
+    feet:           771
+    tongue:         772
+  n_classes:       4
+  tmin:            0.5            # 0.5 s after cue (motor imagery onset)
+  tmax:            2.5            # 2.0 s window → 500 samples at 250 Hz
+  baseline:        null           # no baseline correction post cue
+  reject_threshold: 100e-6        # µV — epoch rejection threshold
+  eog_channels:    [22, 23, 24]   # 0-indexed
+
+# ─────────────────── PREPROCESSING ──────────────────────────
+preprocessing:
+  # Bandpass filter
+  bandpass:
+    low:             4.0           # Hz
+    high:            40.0          # Hz
+    method:          "fir"         # fir | iir
+    fir_window:      "hamming"
+    filter_length:   "auto"
+
+  # Notch filter (power-line interference)
+  notch:
+    freqs:           [50.0, 60.0]  # both 50 Hz (EU) and 60 Hz (US) harmonics
+    notch_widths:    1.0
+
+  # CAR (Common Average Reference)
+  reference:         "CAR"         # CAR | none
+
+  # Standardisation
+  normalization:     "zscore"      # zscore | minmax | none
+
+  # ICA artifact removal (optional — slow; set to false for quick runs)
+  ica:
+    apply:           false
+    n_components:    20
+    method:          "fastica"
+    eog_threshold:   3.0
+
+# ─────────────────── MODEL ARCHITECTURE ─────────────────────
+model:
+  name:              "EEGNetV4"    # EEGNetV4 | ResidualEEGNet | AttentionEEGNet
+  # Shared backbone
+  T:                 500           # time samples (BCI IV 2a at 250 Hz × 2 s)
+  # ─── EEGNet V4 ───
+  eegnet:
+    F1:              8             # temporal filter count
+    D:               2             # spatial depth multiplier  (F2 = F1*D = 16)
+    F2:              16            # separable filter count
+    Tc:              64            # temporal kernel length (Tc/sfreq ≈ 250 ms)
+    pool1:           8             # first avg-pool size
+    pool2:           8             # second avg-pool size
+    dropout:         0.5
+    # For EEGMMIDB pretraining (64 ch, 480 samples at 160 Hz)
+    pretrain:
+      C:             64
+      T:             480
+      n_classes:     4
+    # For BCI IV 2a finetuning (22 ch, 500 samples at 250 Hz)
+    finetune:
+      C:             22
+      T:             500
+      n_classes:     4
+
+# ─────────────────── TRAINING (PRETRAIN) ────────────────────
+pretrain:
+  epochs:            200
+  batch_size:        64
+  optimizer:         "adamw"
+  lr:                1.0e-3
+  weight_decay:      1.0e-4
+  scheduler:         "cosine"      # cosine | step | plateau
+  warmup_epochs:     10
+  mixed_precision:   true
+  early_stopping:
+    patience:        30
+    min_delta:       1.0e-4
+  val_fraction:      0.15
+  seed:              42
+  num_workers:       4
+  pin_memory:        true
+
+# ─────────────────── TRAINING (FINETUNE) ────────────────────
+finetune:
+  epochs:            150
+  batch_size:        32
+  strategy:          "gradual_unfreeze"   # full | freeze_all | gradual_unfreeze
+  # Discriminative learning rates per layer group
+  lr_groups:
+    temporal_conv:   1.0e-5        # frozen early
+    depthwise_conv:  1.0e-5
+    separable_conv:  1.0e-4
+    classifier:      1.0e-3
+  weight_decay:      1.0e-4
+  scheduler:         "cosine"
+  warmup_epochs:     5
+  unfreeze_schedule:             # epoch → layers to unfreeze
+    0:    ["classifier"]
+    20:   ["separable_conv"]
+    40:   ["depthwise_conv"]
+    70:   ["temporal_conv"]
+  label_smoothing:   0.1
+  mixup_alpha:       0.4          # 0.0 to disable
+  mixed_precision:   true
+  early_stopping:
+    patience:        40
+    min_delta:       1.0e-4
+  cross_validation:
+    strategy:        "subject_independent"  # subject_independent | loso | session
+  seed:              42
+  num_workers:       4
+  pin_memory:        true
+
+# ─────────────────── DATA AUGMENTATION ──────────────────────
+augmentation:
+  pretrain:
+    gaussian_noise:   0.1          # std factor of signal std
+    temporal_mask:    true
+    mask_max_len:     20           # samples
+    n_masks:          2
+    freq_shift:       2.0          # Hz
+    channel_dropout:  0.05         # fraction of channels zeroed
+    sliding_window:   true
+    window_step:      10           # samples
+
+  finetune:
+    gaussian_noise:   0.05
+    temporal_mask:    true
+    mask_max_len:     10
+    n_masks:          1
+    channel_dropout:  0.02
+    sliding_window:   false
+
+# ──────────────────── EVALUATION ────────────────────────────
+evaluation:
+  metrics:           ["accuracy", "kappa", "f1_macro", "confusion_matrix"]
+  grad_cam:          true
+  tensorboard:       true
+  save_predictions:  true
